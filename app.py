@@ -1,4 +1,4 @@
-# app.py (UPGRADE: upload bukti, preview, barang, bukti penerimaan)
+# app.py (FINAL) - SAFE FOR STREAMLIT CLOUD
 import streamlit as st
 import pandas as pd
 import os
@@ -6,19 +6,18 @@ from datetime import datetime, timedelta, timezone
 import requests
 import base64
 import io
-import mimetypes
 
 # ======================================================
-#  KONFIGURASI UTAMA (tetap kompatibel dgn app sebelumnya)
+#  KONFIGURASI UTAMA
 # ======================================================
 DATA_FILE = "data/keuangan.csv"
 LOG_FILE = "data/log_aktivitas.csv"
-BARANG_FILE = "data/barang.csv"  # untuk catatan barang
+BARANG_FILE = "data/barang.csv"
 
 # Zona waktu GMT+7
 TZ = timezone(timedelta(hours=7))
 
-# Multi-password untuk panitia (tetap)
+# Multi-password untuk panitia
 PANITIA_USERS = {
     "Ketua": "kelas3ku",
     "Sekretaris": "fatik3762",
@@ -31,7 +30,22 @@ PANITIA_USERS = {
 PUBLIK_MODE = "PUBLIK"
 PANITIA_MODE = "PANITIA"
 
-# Pastikan folder data ada (untuk fallback lokal)
+# ======================================================
+# TEMP LOCAL PATH (writeable on Streamlit Cloud)
+# Use /mount/data/... if available; otherwise fallback to ./data/...
+# ======================================================
+DEFAULT_TMP_ROOT = "/mount/data"
+if not os.path.exists(DEFAULT_TMP_ROOT):
+    DEFAULT_TMP_ROOT = "data"  # fallback local
+
+LOCAL_TMP_BUKTI_UANG = os.path.join(DEFAULT_TMP_ROOT, "bukti_uang")
+LOCAL_TMP_BUKTI_PENERIMAAN = os.path.join(DEFAULT_TMP_ROOT, "bukti_penerimaan")
+LOCAL_TMP_BUKTI_BARANG = os.path.join(DEFAULT_TMP_ROOT, "bukti_barang")
+os.makedirs(LOCAL_TMP_BUKTI_UANG, exist_ok=True)
+os.makedirs(LOCAL_TMP_BUKTI_PENERIMAAN, exist_ok=True)
+os.makedirs(LOCAL_TMP_BUKTI_BARANG, exist_ok=True)
+
+# also ensure data folder exists for fallback local CSVs
 os.makedirs("data", exist_ok=True)
 
 # ======================================================
@@ -54,7 +68,7 @@ if "GITHUB_LOG_PATH" in st.secrets:
 if "GITHUB_BARANG_PATH" in st.secrets:
     GITHUB_BARANG_PATH = st.secrets["GITHUB_BARANG_PATH"]
 
-# defaults (jika tidak diberikan via secrets)
+# defaults
 if not GITHUB_DATA_PATH:
     GITHUB_DATA_PATH = "data/keuangan.csv"
 if not GITHUB_LOG_PATH:
@@ -62,12 +76,12 @@ if not GITHUB_LOG_PATH:
 if not GITHUB_BARANG_PATH:
     GITHUB_BARANG_PATH = "data/barang.csv"
 
-# Helper: raw URL
+# Helper raw URL (read-only)
 def github_raw_url(repo, path, branch="main"):
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
 # ======================================================
-#  GITHUB HELPERS (GET content, PUT update, create file)
+#  GITHUB API HELPERS
 # ======================================================
 def github_get_file(repo, path):
     """Return tuple (content_text, sha) or (None, None) on error."""
@@ -90,9 +104,10 @@ def github_get_file(repo, path):
 
 def github_put_file(repo, path, content_bytes_or_text, commit_message="Update via Streamlit", sha=None, is_binary=False):
     """
-    Create or update file in GitHub repo. content_bytes_or_text: bytes or str.
+    Create or update file in GitHub repo.
+    content_bytes_or_text: bytes or str.
     If is_binary True, content is bytes and will be base64 encoded directly.
-    Returns True if success, else False.
+    Returns True if success.
     """
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return False
@@ -112,7 +127,7 @@ def github_put_file(repo, path, content_bytes_or_text, commit_message="Update vi
     return r.status_code in (200, 201)
 
 # ======================================================
-#  HELPER LOCAL FILE ENSURE
+#  LOCAL FILE ENSURE helpers
 # ======================================================
 def ensure_local_file(path, columns):
     if not os.path.exists(path):
@@ -120,7 +135,7 @@ def ensure_local_file(path, columns):
         df.to_csv(path, index=False)
 
 # ======================================================
-#  FUNGSI DATA & LOG (mendukung GitHub atau fallback lokal)
+#  DATA LOAD / SAVE (supports GitHub raw read + API write; fallback local)
 # ======================================================
 def load_data():
     # Try GitHub raw first
@@ -154,13 +169,6 @@ def save_data(df):
     else:
         df.to_csv(DATA_FILE, index=False)
         return True
-
-def ensure_remote_log_exists():
-    if GITHUB_TOKEN and GITHUB_REPO:
-        content, sha = github_get_file(GITHUB_REPO, GITHUB_LOG_PATH)
-        if content is None:
-            header_df = pd.DataFrame(columns=["Waktu", "Pengguna", "Aksi", "Detail"])
-            github_put_file(GITHUB_REPO, GITHUB_LOG_PATH, header_df.to_csv(index=False), commit_message="Create log_aktivitas.csv via Streamlit", is_binary=False)
 
 def load_log():
     if GITHUB_TOKEN and GITHUB_REPO:
@@ -212,7 +220,7 @@ def clear_log():
     df.to_csv(LOG_FILE, index=False)
 
 # ======================================================
-#  BARANG: load/save (terpisah dari keuangan)
+#  BARANG load/save
 # ======================================================
 def load_barang():
     if GITHUB_TOKEN and GITHUB_REPO:
@@ -246,39 +254,9 @@ def save_barang(df):
         return True
 
 # ======================================================
-#  FILE UPLOAD HELPERS (upload ke GitHub path atau simpan lokal)
+#  FILE UPLOAD: save temp locally (to /mount/data if available) then upload to GitHub (if configured)
 # ======================================================
-def upload_file_to_repo(folder_path, filename, file_bytes):
-    """
-    Upload given bytes to repo path `folder_path/filename`.
-    Returns raw URL (https://raw.githubusercontent...) on success, else None.
-    """
-    # ensure folder path ends without slash
-    folder_path = folder_path.strip("/")
-
-    path = f"{folder_path}/{filename}"
-    if GITHUB_TOKEN and GITHUB_REPO:
-        # check if exists to get sha (not necessary for new files, but harmless)
-        _, sha = github_get_file(GITHUB_REPO, path)
-        ok = github_put_file(GITHUB_REPO, path, file_bytes, commit_message=f"Upload {filename} via Streamlit", sha=sha, is_binary=True)
-        if ok:
-            # raw url
-            raw = github_raw_url(GITHUB_REPO, path)
-            return raw
-        else:
-            return None
-    else:
-        # fallback local save
-        local_dir = os.path.join("data", folder_path)
-        os.makedirs(local_dir, exist_ok=True)
-        local_path = os.path.join(local_dir, filename)
-        with open(local_path, "wb") as f:
-            f.write(file_bytes)
-        # return local file URL path (file:// may not be accessible in Streamlit web, so return relative path)
-        return local_path
-
 def make_safe_filename(prefix, original_name):
-    # timestamp + sanitized original
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
     base = os.path.splitext(original_name)[0]
     ext = os.path.splitext(original_name)[1].lower()
@@ -286,11 +264,54 @@ def make_safe_filename(prefix, original_name):
     safe_base = safe_base.replace(" ", "_")
     return f"{prefix}_{ts}_{safe_base}{ext}"
 
+def upload_file_to_repo(folder_path, filename, file_bytes, tmp_kind="uang"):
+    """
+    1) write temp file to a writeable location (LOCAL_TMP_*)
+    2) if GitHub configured: upload bytes to GitHub path: folder_path/filename
+    3) return raw URL (if uploaded to GitHub) or local temp path (if not)
+    """
+    # choose tmp folder
+    if tmp_kind == "uang":
+        local_tmp_dir = LOCAL_TMP_BUKTI_UANG
+    elif tmp_kind == "penerimaan":
+        local_tmp_dir = LOCAL_TMP_BUKTI_PENERIMAAN
+    elif tmp_kind == "barang":
+        local_tmp_dir = LOCAL_TMP_BUKTI_BARANG
+    else:
+        local_tmp_dir = LOCAL_TMP_BUKTI_UANG
+
+    os.makedirs(local_tmp_dir, exist_ok=True)
+    local_path = os.path.join(local_tmp_dir, filename)
+
+    # write temp file
+    with open(local_path, "wb") as f:
+        f.write(file_bytes)
+
+    # Attempt GitHub upload if configured
+    if GITHUB_TOKEN and GITHUB_REPO:
+        # read bytes back (we already have file_bytes, but ensure correct)
+        try:
+            ok = github_put_file(GITHUB_REPO, folder_path + "/" + filename, file_bytes, commit_message=f"Upload {filename} via Streamlit", is_binary=True)
+            if ok:
+                raw = github_raw_url(GITHUB_REPO, folder_path + "/" + filename)
+                # remove temp file to save space (optional)
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
+                return raw
+            else:
+                return local_path
+        except Exception:
+            return local_path
+    else:
+        return local_path
+
 # ======================================================
-#  Pastikan remote files minimal ada saat app start
+#  Ensure minimal files exist on remote or local
 # ======================================================
 if GITHUB_TOKEN and GITHUB_REPO:
-    # ensure data file exists
+    # ensure keuangan exists
     content, sha = github_get_file(GITHUB_REPO, GITHUB_DATA_PATH)
     if content is None:
         df0 = pd.DataFrame([{"Tanggal": datetime.now(TZ).strftime("%Y-%m-%d"),
@@ -301,16 +322,19 @@ if GITHUB_TOKEN and GITHUB_REPO:
                              "Bukti": "",
                              "Bukti_Penerimaan": ""}])
         github_put_file(GITHUB_REPO, GITHUB_DATA_PATH, df0.to_csv(index=False), commit_message="Create keuangan.csv via Streamlit", is_binary=False)
-    # ensure log file
-    ensure_remote_log_exists()
-    # ensure barang file
+    # ensure log exists
+    content_log, sha_log = github_get_file(GITHUB_REPO, GITHUB_LOG_PATH)
+    if content_log is None:
+        df_log = pd.DataFrame(columns=["Waktu", "Pengguna", "Aksi", "Detail"])
+        github_put_file(GITHUB_REPO, GITHUB_LOG_PATH, df_log.to_csv(index=False), commit_message="Create log_aktivitas.csv via Streamlit", is_binary=False)
+    # ensure barang exists
     content_b, sha_b = github_get_file(GITHUB_REPO, GITHUB_BARANG_PATH)
     if content_b is None:
         df_b = pd.DataFrame(columns=["Tanggal", "Jenis", "Keterangan", "Jumlah", "Satuan", "Bukti"])
         github_put_file(GITHUB_REPO, GITHUB_BARANG_PATH, df_b.to_csv(index=False), commit_message="Create barang.csv via Streamlit", is_binary=False)
 
 # ======================================================
-#  TEMA WARNA NU (tidak diubah)
+#  THEME (tidak diubah)
 # ======================================================
 st.markdown("""
     <style>
@@ -338,7 +362,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-#  PILIH MODE (tetap)
+#  MODE PICKER (PUBLIK / PANITIA)
 # ======================================================
 st.sidebar.header("📌 Pilih Mode")
 mode = st.sidebar.radio("Mode", [PUBLIK_MODE, PANITIA_MODE])
@@ -355,7 +379,6 @@ if mode == PUBLIK_MODE:
         st.info("Belum ada data keuangan.")
     else:
         st.subheader("📄 Laporan Keuangan")
-        # show table but hide raw bukti links; we'll show preview below
         st.dataframe(df.drop(columns=[c for c in ["Bukti","Bukti_Penerimaan"] if c in df.columns]), use_container_width=True)
 
         # Provide preview expander per row if bukti exists
@@ -365,8 +388,7 @@ if mode == PUBLIK_MODE:
             bukti_penerimaan = row.get("Bukti_Penerimaan", "") if "Bukti_Penerimaan" in row else ""
             if pd.notna(bukti) and bukti:
                 with st.expander(f"[{i}] {row.get('Tanggal','')} — {row.get('Keterangan','')} (Bukti)"):
-                    if bukti.endswith((".jpg", ".jpeg", ".png")) or (bukti.startswith("data/") and any(bukti.lower().endswith(ext) for ext in [".jpg",".jpeg",".png"])):
-                        # If remote raw URL or local path
+                    if isinstance(bukti, str) and (bukti.endswith((".jpg", ".jpeg", ".png")) or (bukti.startswith("data/") and any(bukti.lower().endswith(ext) for ext in [".jpg",".jpeg",".png"]))):
                         try:
                             if bukti.startswith("http"):
                                 st.image(bukti, use_column_width=True)
@@ -378,8 +400,7 @@ if mode == PUBLIK_MODE:
                         st.markdown(f"[Lihat Bukti (file)]({bukti})")
             if pd.notna(bukti_penerimaan) and bukti_penerimaan:
                 with st.expander(f"[{i}] {row.get('Tanggal','')} — {row.get('Keterangan','')} (Bukti Penerimaan)"):
-                    if bukti_penerimaan.startswith("http"):
-                        # pdf or image link
+                    if isinstance(bukti_penerimaan, str) and bukti_penerimaan.startswith("http"):
                         if bukti_penerimaan.lower().endswith((".jpg",".jpeg",".png")):
                             st.image(bukti_penerimaan, use_column_width=True)
                         else:
@@ -387,13 +408,45 @@ if mode == PUBLIK_MODE:
                     else:
                         st.markdown(f"Lokal: {bukti_penerimaan}")
 
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Data CSV",
-            csv,
-            "keuangan_musholla.csv",
-            "text/csv",
-        )
+    # ======================================================
+    #  TAMPILAN BARANG DI PUBLIK
+    # ======================================================
+    st.subheader("📦 Laporan Barang Masuk / Keluar")
+
+    dfb = load_barang()
+
+    if dfb.empty:
+        st.info("Belum ada data barang yang dicatat.")
+    else:
+        cols_to_show = [c for c in dfb.columns if c != "Bukti"]
+        st.dataframe(dfb[cols_to_show], use_container_width=True)
+
+        st.subheader("🔍 Bukti Barang")
+        for i, row in dfb.iterrows():
+            bukti = row.get("Bukti", "")
+            if pd.notna(bukti) and bukti:
+                with st.expander(f"[{i}] {row.get('Tanggal','')} — {row.get('Jenis','')} — {row.get('Keterangan','')}"):
+                    try:
+                        if isinstance(bukti, str) and bukti.startswith("http") and bukti.lower().endswith((".jpg",".jpeg",".png")):
+                            st.image(bukti, use_column_width=True)
+                        elif isinstance(bukti, str) and bukti.startswith("http"):
+                            st.markdown(f"[Lihat Bukti Barang]({bukti})")
+                        else:
+                            st.image(open(bukti, "rb").read(), use_column_width=True)
+                    except Exception:
+                        st.markdown(f"[Lihat Bukti Barang]({bukti})")
+
+    # -------------------------
+    # DOWNLOAD CSV (PUBLIK)
+    # -------------------------
+    st.subheader("⬇️ Download Data CSV")
+    csv_keu = df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download Keuangan (CSV)", csv_keu, "keuangan_musholla.csv", "text/csv")
+
+    csv_barang = dfb.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download Barang (CSV)", csv_barang, "barang_musholla.csv", "text/csv")
+
+    st.stop()
 
 # ======================================================
 #  MODE PANITIA
@@ -416,7 +469,7 @@ else:
     df = load_data()
 
     # -------------------------
-    # FORM TAMBAH DATA (TETAP) + Upload Bukti (baru)
+    # FORM TAMBAH DATA + Upload Bukti
     # -------------------------
     st.subheader("➕ Tambah Data Baru")
 
@@ -428,41 +481,31 @@ else:
         masuk = st.number_input("Uang Masuk", min_value=0, step=1000)
         keluar = st.number_input("Uang Keluar", min_value=0, step=1000)
 
-    # Upload bukti nota (opsional)
     uploaded_file = st.file_uploader("Upload Nota / Bukti (opsional) — gambar/pdf", type=["jpg","jpeg","png","pdf"])
-    # Bukti penerimaan (opsional)
     uploaded_bukti_penerimaan = st.file_uploader("Upload Bukti Penerimaan / Kwitansi (opsional)", type=["jpg","jpeg","png","pdf"])
 
     if st.button("Simpan Data"):
-        # recalc saldo: ambil saldo terakhir dari sumber (remote jika ada)
         df = load_data()
         saldo_akhir = df["Saldo"].iloc[-1] if (not df.empty and "Saldo" in df.columns) else 0
         saldo_baru = saldo_akhir + masuk - keluar
 
-        # handle bukti upload (nota)
         bukti_url = ""
         if uploaded_file is not None:
             safe_name = make_safe_filename("nota", uploaded_file.name)
             file_bytes = uploaded_file.getvalue()
-            # upload to repo folder data/bukti or save locally under data/bukti/
-            remote = upload_file_to_repo("data/bukti", safe_name, file_bytes)
+            # write temp to /mount then upload to GitHub data/bukti
+            remote = upload_file_to_repo("data/bukti", safe_name, file_bytes, tmp_kind="uang")
             if remote:
                 bukti_url = remote
-            else:
-                bukti_url = ""
 
-        # handle bukti penerimaan
         bukti_penerimaan_url = ""
         if uploaded_bukti_penerimaan is not None:
             safe_name2 = make_safe_filename("penerimaan", uploaded_bukti_penerimaan.name)
             file_bytes2 = uploaded_bukti_penerimaan.getvalue()
-            remote2 = upload_file_to_repo("data/penerimaan", safe_name2, file_bytes2)
+            remote2 = upload_file_to_repo("data/penerimaan", safe_name2, file_bytes2, tmp_kind="penerimaan")
             if remote2:
                 bukti_penerimaan_url = remote2
-            else:
-                bukti_penerimaan_url = ""
 
-        # ensure df has bukti columns
         if "Bukti" not in df.columns:
             df["Bukti"] = ""
         if "Bukti_Penerimaan" not in df.columns:
@@ -479,7 +522,6 @@ else:
         }
 
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
         ok = save_data(df)
         save_log(username, "Tambah Data", f"{keterangan} | +{masuk} / -{keluar} | bukti={bool(bukti_url)} | bukti_penerimaan={bool(bukti_penerimaan_url)}")
 
@@ -493,11 +535,10 @@ else:
     # -------------------------
     st.subheader("📄 Tabel Keuangan")
     df = load_data()
-    # show table without raw bukti columns for compactness
     display_cols = [c for c in df.columns if c not in ["Bukti", "Bukti_Penerimaan"]]
     st.dataframe(df[display_cols], use_container_width=True)
 
-    # preview bukti per baris (expander)
+    # preview bukti per baris
     st.subheader("🔍 Preview Bukti per Baris")
     for i, row in df.iterrows():
         bukti = row.get("Bukti", "") if "Bukti" in row else ""
@@ -505,24 +546,20 @@ else:
         if pd.notna(bukti) and bukti:
             with st.expander(f"[{i}] {row.get('Tanggal','')} — {row.get('Keterangan','')} (Bukti)"):
                 try:
-                    if bukti.startswith("http") and bukti.lower().endswith((".jpg",".jpeg",".png")):
+                    if isinstance(bukti, str) and bukti.startswith("http") and bukti.lower().endswith((".jpg",".jpeg",".png")):
                         st.image(bukti, use_column_width=True)
-                    elif bukti.startswith("http"):
+                    elif isinstance(bukti, str) and bukti.startswith("http"):
                         st.markdown(f"[Lihat Bukti]({bukti})")
                     else:
-                        # local path
-                        try:
-                            st.image(open(bukti, "rb").read(), use_column_width=True)
-                        except Exception:
-                            st.markdown(f"Lokal: {bukti}")
+                        st.image(open(bukti, "rb").read(), use_column_width=True)
                 except Exception:
                     st.markdown(f"[Lihat Bukti]({bukti})")
         if pd.notna(bukti_penerimaan) and bukti_penerimaan:
             with st.expander(f"[{i}] {row.get('Tanggal','')} — {row.get('Keterangan','')} (Bukti Penerimaan)"):
                 try:
-                    if bukti_penerimaan.startswith("http") and bukti_penerimaan.lower().endswith((".jpg",".jpeg",".png")):
+                    if isinstance(bukti_penerimaan, str) and bukti_penerimaan.startswith("http") and bukti_penerimaan.lower().endswith((".jpg",".jpeg",".png")):
                         st.image(bukti_penerimaan, use_column_width=True)
-                    elif bukti_penerimaan.startswith("http"):
+                    elif isinstance(bukti_penerimaan, str) and bukti_penerimaan.startswith("http"):
                         st.markdown(f"[Lihat Bukti Penerimaan]({bukti_penerimaan})")
                     else:
                         st.markdown(f"Lokal: {bukti_penerimaan}")
@@ -530,15 +567,11 @@ else:
                     st.markdown(f"[Lihat Bukti Penerimaan]({bukti_penerimaan})")
 
     # -------------------------
-    # TOMBOL HAPUS BARIS (Tetap)
+    # HAPUS BARIS
     # -------------------------
     st.subheader("🗑 Hapus Baris Data")
     if not df.empty:
-        idx = st.number_input(
-            f"Pilih nomor baris (0 - {len(df)-1})",
-            min_value=0, max_value=len(df)-1, step=1
-        )
-
+        idx = st.number_input(f"Pilih nomor baris (0 - {len(df)-1})", min_value=0, max_value=len(df)-1, step=1)
         if st.button("Hapus Baris"):
             deleted = df.iloc[idx].to_dict()
             df = df.drop(idx).reset_index(drop=True)
@@ -550,15 +583,20 @@ else:
                 st.warning("Perubahan disimpan lokal karena gagal menyimpan ke GitHub.")
 
     # -------------------------
-    # DOWNLOAD CSV (tetap)
+    # DOWNLOAD CSV (PANITIA)
     # -------------------------
     st.subheader("⬇️ Download Data")
-    csv = df.to_csv(index=False).encode("utf-8")
-    if st.download_button("Download CSV", csv, "keuangan_musholla.csv", "text/csv"):
+    csv_keu = df.to_csv(index=False).encode("utf-8")
+    if st.download_button("Download Keuangan (CSV)", csv_keu, "keuangan_musholla.csv", "text/csv"):
         save_log(username, "Download CSV", "Mengunduh data keuangan")
 
+    dfb = load_barang()
+    csv_brg = dfb.to_csv(index=False).encode("utf-8")
+    if st.download_button("Download Barang (CSV)", csv_brg, "barang_musholla.csv", "text/csv"):
+        save_log(username, "Download CSV Barang", "Mengunduh data barang")
+
     # -------------------------
-    # LOG AKTIVITAS (tetap)
+    # LOG AKTIVITAS (PALING BAWAH)
     # -------------------------
     st.subheader("📘 Log Aktivitas Panitia")
     log_df = load_log()
@@ -575,7 +613,7 @@ else:
             st.success("Semua log aktivitas berhasil dihapus!")
 
     # -------------------------
-    # BAGIAN BARANG (baru)
+    # BAGIAN BARANG (PANITIA)
     # -------------------------
     st.markdown("---")
     st.subheader("📦 Catatan Barang (Masuk/Keluar Non-Uang)")
@@ -594,7 +632,7 @@ else:
             bukti_barang_url = ""
             if file_brg is not None:
                 safe = make_safe_filename("barang", file_brg.name)
-                remote_b = upload_file_to_repo("data/bukti_barang", safe, file_brg.getvalue())
+                remote_b = upload_file_to_repo("data/bukti_barang", safe, file_brg.getvalue(), tmp_kind="barang")
                 if remote_b:
                     bukti_barang_url = remote_b
             newb = {
@@ -624,9 +662,14 @@ else:
                 b = r.get("Bukti", "")
                 if pd.notna(b) and b:
                     with st.expander(f"[{i}] {r.get('Tanggal','')} — {r.get('Keterangan','')} (Bukti Barang)"):
-                        if b.startswith("http") and b.lower().endswith((".jpg",".jpeg",".png")):
-                            st.image(b, use_column_width=True)
-                        else:
+                        try:
+                            if isinstance(b, str) and b.startswith("http") and b.lower().endswith((".jpg",".jpeg",".png")):
+                                st.image(b, use_column_width=True)
+                            elif isinstance(b, str) and b.startswith("http"):
+                                st.markdown(f"[Lihat Bukti Barang]({b})")
+                            else:
+                                st.image(open(b, "rb").read(), use_column_width=True)
+                        except Exception:
                             st.markdown(f"[Lihat Bukti Barang]({b})")
 
 # End of app.py
